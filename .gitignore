@@ -1,6 +1,12 @@
 build/
 *.o
+*.d
 *.out
 a.out
 .vscode/
 .DS_Store
+
+# Log directories created by the CLI, demos and benchmarks.
+chainlog.d/
+*.chainlog.d/
+bench/tmp/
