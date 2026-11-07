@@ -1,10 +1,9 @@
-// The append-only log, the checkpoints beside it, and the checks over both.
+// The append-only log, the write-ahead log and the checkpoints beside it,
+// and the checks over all three.
 //
-// Phase 3 scope: append() writes the frame, fsyncs, and seals a Merkle
-// checkpoint when it crosses a block boundary. That is durable but not yet
-// crash-atomic -- a crash in the middle of the record write leaves a torn
-// frame at the tail, which verify() reports as torn-tail. Phase 4 wraps the
-// same write in a write-ahead log so that case becomes recoverable.
+// append() now routes every record through log.wal first, so a crash part-way
+// through the main write is recoverable rather than merely detectable. See
+// wal.h for the protocol and for why those are different properties.
 #ifndef CHAINLOG_LOG_H
 #define CHAINLOG_LOG_H
 
@@ -13,9 +12,11 @@
 #include <vector>
 
 #include "checkpoint.h"
+#include "faultinject.h"
 #include "fileio.h"
 #include "merkle.h"
 #include "record.h"
+#include "wal.h"
 
 namespace chainlog {
 
@@ -36,6 +37,9 @@ class Log {
     uint64_t sealed_blocks = 0;
     uint64_t checkpoint_count = 0;
     uint64_t pending_records = 0;  // appended but not yet in a sealed block
+    bool wal_pending = false;      // a record is staged but not applied
+    bool read_only = false;        // opened without write access
+    bool locked = false;           // holding the flock
   };
 
   // Why `prove` could not produce a proof, when it could not.
@@ -69,16 +73,33 @@ class Log {
   // checks framing only (magic, lengths, CRC); it does not recompute SHA-256,
   // so it is far cheaper than verify().
   //
-  // It also performs one narrow repair: if the log ends exactly on a block
-  // boundary and the last block has no checkpoint, that block is sealed. See
-  // reconcile_checkpoints() for why at most one block can ever be missing and
-  // why anything more is reported rather than repaired.
+  // Opening also recovers and repairs, in this order:
+  //
+  //   * takes an exclusive flock, so two writers cannot interleave. If the
+  //     directory is not writable it falls back to a shared lock and a
+  //     read-only open, because an archived log must still be verifiable.
+  //   * replays or discards a staged WAL record (see recover_wal).
+  //   * seals a complete-but-unsealed trailing block, or trims a torn
+  //     trailing checkpoint frame (see reconcile_checkpoints for why at most
+  //     one block can ever be missing, and why anything more is reported
+  //     rather than repaired).
   bool open(const std::string& dir, const Options& opt, std::string* err);
 
   bool is_open() const { return log_fd_.valid(); }
 
-  // Appends a record carrying `data`, fsyncs, and seals a checkpoint if this
-  // record completes a block. Refuses if the open-time scan found damage.
+  // Releases every descriptor, and with them the flock -- an flock lives on
+  // the open file description, so closing it IS unlocking. The object is
+  // unusable afterwards until open() is called again.
+  //
+  // Worth having explicitly rather than relying on the destructor: holding
+  // one Log open while opening a second on the same directory is refused by
+  // the lock, so code that wants to hand the log over needs a way to say
+  // when it is finished.
+  void close();
+
+  // Appends a record carrying `data` through the write-ahead log, and seals a
+  // checkpoint if this record completes a block. Refuses if the log was
+  // opened read-only, or if the open-time scan found damage.
   bool append(const std::string& data, Record* out, std::string* err);
 
   // Recomputes every record hash, every chain link and every checkpoint root
@@ -109,6 +130,13 @@ class Log {
   uint64_t block_size() const { return header_.block_size; }
   uint64_t record_count() const { return record_count_; }
   uint64_t checkpoint_count() const { return checkpoint_count_; }
+  bool read_only() const { return read_only_; }
+  bool locked() const { return locked_; }
+
+  // True when a record is staged in the WAL and has not been applied. After
+  // a read-write open this is always false, because open() recovers. It can
+  // be true after a read-only open, which cannot write and so cannot replay.
+  bool wal_pending() const { return wal_pending_; }
 
   // What the open-time scan concluded. ok() unless something is damaged.
   const Verdict& scan_verdict() const { return scan_verdict_; }
@@ -128,6 +156,15 @@ class Log {
   // structural problem found.
   bool scan_tail(std::string* err);
 
+  // Takes an exclusive flock (shared, when read-only). Fails rather than
+  // waiting: a second writer should be told so, not silently queued behind an
+  // appender that might run for hours.
+  bool take_lock(std::string* err);
+
+  // Replays a staged WAL record, discards a torn one, or reports one that
+  // does not fit. Returns false only on I/O failure.
+  bool recover_wal(std::string* err);
+
   // Compares the number of checkpoints against the number of complete blocks
   // and repairs the one discrepancy a crash can produce.
   bool reconcile_checkpoints(std::string* err);
@@ -138,8 +175,16 @@ class Log {
 
   std::string dir_;
   Fd log_fd_;
+  Fd wal_fd_;
   Fd ckpt_fd_;
+  // Held for the object's whole lifetime: an flock is released when its file
+  // description is closed, so this descriptor IS the lock.
+  Fd lock_fd_;
   Header header_;
+
+  bool read_only_ = false;
+  bool locked_ = false;
+  bool wal_pending_ = false;
 
   // Cached tail state, so append() does not rescan the file every time.
   // next_index_ comes from the last frame's stored index + 1, not from the

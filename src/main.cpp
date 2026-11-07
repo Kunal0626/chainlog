@@ -143,6 +143,16 @@ int cmd_verify(const chainlog::Log& log) {
   }
   if (v.ok()) {
     std::printf("%s\n", v.message().c_str());
+    if (log.wal_pending()) {
+      // Only reachable after a read-only open, which cannot replay. Worth
+      // saying out loud: the chain is intact, but one record is staged and
+      // not yet part of it, so this count is not the final one.
+      std::fprintf(stderr,
+                   "chainlog: note: a record is staged in the write-ahead log "
+                   "and has not been applied\n"
+                   "chainlog: the log was opened read-only, so it could not "
+                   "be replayed; reopen with write access to recover\n");
+    }
     return kExitOk;
   }
   std::fprintf(stderr, "chainlog: verification FAILED: %s\n",
@@ -177,6 +187,9 @@ int cmd_stats(const chainlog::Log& log) {
               static_cast<unsigned long long>(s.checkpoint_count));
   std::printf("pending_records=%llu\n",
               static_cast<unsigned long long>(s.pending_records));
+  std::printf("wal_pending=%d\n", s.wal_pending ? 1 : 0);
+  std::printf("read_only=%d\n", s.read_only ? 1 : 0);
+  std::printf("locked=%d\n", s.locked ? 1 : 0);
   return kExitOk;
 }
 

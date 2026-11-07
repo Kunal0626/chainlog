@@ -8,6 +8,7 @@
 #include <vector>
 
 #include <fcntl.h>
+#include <sys/file.h>
 #include <unistd.h>
 
 namespace chainlog {
@@ -22,15 +23,60 @@ constexpr size_t kReadChunk = 256 * 1024;
 constexpr uint64_t kCheckpointFrameBytes =
     kCheckpointOverheadBytes + kCheckpointPayloadBytes;
 
-// Cuts a file back to `len` and makes the new length durable.
-bool truncate_to(int fd, uint64_t len, std::string* err) {
+// Cuts a file back to `len`, without a barrier.
+bool truncate_only(int fd, uint64_t len, std::string* err) {
   if (::ftruncate(fd, static_cast<off_t>(len)) != 0) {
     if (err != nullptr) {
       *err = errno_text("ftruncate");
     }
     return false;
   }
-  return full_fsync(fd, err);
+  return true;
+}
+
+// Cuts a file back to `len` and makes the new length durable.
+bool truncate_to(int fd, uint64_t len, std::string* err) {
+  return truncate_only(fd, len, err) && full_fsync(fd, err);
+}
+
+// Opens `path` for reading and writing, falling back to read-only when the
+// permissions or the filesystem do not allow writing. *read_only is sticky:
+// once any file in the directory has fallen back, the whole log is read-only.
+//
+// The fallback exists because an archived log, or one on a read-only mount,
+// must still be verifiable. Refusing to look at a log you cannot write would
+// make the verifier useless in exactly the situation where you most want it.
+// `allow_missing` covers the WAL and the checkpoints file, which an archived
+// log need not carry at all.
+bool open_log_file(const std::string& path, bool allow_missing, Fd* out,
+                   bool* read_only, std::string* err) {
+  if (!*read_only) {
+    const int fd = ::open(path.c_str(), O_RDWR | O_CREAT, 0644);
+    if (fd >= 0) {
+      out->reset(fd);
+      return true;
+    }
+    if (errno != EACCES && errno != EROFS && errno != EPERM) {
+      if (err != nullptr) {
+        *err = errno_text("open(" + path + ")");
+      }
+      return false;
+    }
+    *read_only = true;
+  }
+
+  const int fd = ::open(path.c_str(), O_RDONLY);
+  if (fd >= 0) {
+    out->reset(fd);
+    return true;
+  }
+  if (allow_missing && errno == ENOENT) {
+    return true;  // Left invalid; callers treat that as "empty".
+  }
+  if (err != nullptr) {
+    *err = errno_text("open(" + path + ")");
+  }
+  return false;
 }
 
 // A sequential, buffered reader over a byte range of a file.
@@ -205,28 +251,39 @@ bool Log::open(const std::string& dir, const Options& opt, std::string* err) {
     return false;
   }
 
-  // Both files are opened before either is interpreted, so that even a log
-  // with an unreadable header still has a usable checkpoints descriptor for
-  // reporting.
+  // Every file is opened before any of them is interpreted, so that even a
+  // log with an unreadable header still has usable descriptors for
+  // reporting. The log file goes first because whether it can be opened for
+  // writing is what decides read-only mode for everything else.
   const std::string path = log_path(dir);
-  const int fd = ::open(path.c_str(), O_RDWR | O_CREAT, 0644);
-  if (fd < 0) {
-    *err = errno_text("open(" + path + ")");
+  if (!open_log_file(path, false, &log_fd_, &read_only_, err)) {
     return false;
   }
-  log_fd_.reset(fd);
-
-  const std::string cpath = checkpoints_path(dir);
-  const int cfd = ::open(cpath.c_str(), O_RDWR | O_CREAT, 0644);
-  if (cfd < 0) {
-    *err = errno_text("open(" + cpath + ")");
+  if (!take_lock(err)) {
     return false;
   }
-  ckpt_fd_.reset(cfd);
+  if (!open_log_file(wal_path(dir), true, &wal_fd_, &read_only_, err)) {
+    return false;
+  }
+  if (!open_log_file(checkpoints_path(dir), true, &ckpt_fd_, &read_only_,
+                     err)) {
+    return false;
+  }
 
   uint64_t len = 0;
   if (!file_length(log_fd_.get(), &len, err)) {
     return false;
+  }
+
+  if (len == 0 && read_only_) {
+    // An empty log file we cannot write to: nothing to create, nothing to
+    // scan. Treated as an empty log rather than a damaged one.
+    header_ = Header();
+    header_.block_size =
+        (opt.block_size == 0) ? kDefaultBlockSize : opt.block_size;
+    last_hash_ = genesis_prev_hash();
+    log_end_ = 0;
+    return true;
   }
 
   if (len == 0) {
@@ -275,10 +332,29 @@ bool Log::open(const std::string& dir, const Options& opt, std::string* err) {
     }
   }
 
+  // The WAL is recovered before the checkpoints are reconciled, because
+  // replaying a staged record can complete a block and therefore change how
+  // many checkpoints are expected.
+  if (!recover_wal(err)) {
+    return false;
+  }
+
   // The checkpoints file, now that block_size is known.
   uint64_t clen = 0;
-  if (!file_length(ckpt_fd_.get(), &clen, err)) {
+  if (ckpt_fd_.valid() && !file_length(ckpt_fd_.get(), &clen, err)) {
     return false;
+  }
+  if (!ckpt_fd_.valid()) {
+    // Read-only log with no checkpoints file at all. Nothing to read and
+    // nothing to repair; the record chain is still fully verifiable.
+    checkpoint_count_ = 0;
+    ckpt_end_ = 0;
+    return true;
+  }
+  if (clen == 0 && read_only_) {
+    checkpoint_count_ = 0;
+    ckpt_end_ = 0;
+    return true;
   }
   if (clen == 0) {
     CheckpointHeader ch;
@@ -439,9 +515,180 @@ bool Log::read_checkpoints(std::vector<Checkpoint>* out, Verdict* v,
   return true;
 }
 
+void Log::close() {
+  // Order is deliberate: the lock goes last, so nothing can open this
+  // directory for writing until every other descriptor is already gone.
+  log_fd_.reset();
+  wal_fd_.reset();
+  ckpt_fd_.reset();
+  lock_fd_.reset();
+  locked_ = false;
+}
+
+bool Log::take_lock(std::string* err) {
+  const std::string path = lock_path(dir_);
+
+  int fd = ::open(path.c_str(), O_RDWR | O_CREAT, 0644);
+  if (fd < 0) {
+    if (read_only_ && (errno == EACCES || errno == EROFS || errno == EPERM ||
+                       errno == ENOENT)) {
+      // An archived log on a read-only mount cannot have a lock file
+      // created. Reading it unlocked is safe: nothing can be writing to a
+      // filesystem that will not accept writes. stats reports locked=0 so
+      // this is never silent.
+      locked_ = false;
+      return true;
+    }
+    *err = errno_text("open(" + path + ")");
+    return false;
+  }
+  lock_fd_.reset(fd);
+
+  // A reader takes a shared lock so that several `verify` runs can proceed at
+  // once; a writer takes an exclusive one. LOCK_NB rather than blocking: a
+  // second writer should be told the log is busy, not silently queued behind
+  // an appender that might run for hours.
+  const int how = read_only_ ? (LOCK_SH | LOCK_NB) : (LOCK_EX | LOCK_NB);
+  if (::flock(lock_fd_.get(), how) != 0) {
+    if (errno == EWOULDBLOCK) {
+      *err = "another chainlog process is using " + dir_ + " (could not take " +
+             (read_only_ ? "a shared" : "an exclusive") + " lock on " + path +
+             ")";
+      return false;
+    }
+    *err = errno_text("flock(" + path + ")");
+    return false;
+  }
+  locked_ = true;
+  return true;
+}
+
+bool Log::recover_wal(std::string* err) {
+  wal_pending_ = false;
+  if (!wal_fd_.valid()) {
+    return true;  // No WAL file: an archived log need not carry one.
+  }
+
+  uint64_t len = 0;
+  if (!file_length(wal_fd_.get(), &len, err)) {
+    return false;
+  }
+
+  if (len == 0) {
+    if (read_only_) {
+      return true;
+    }
+    // Brand new. Write the header so that "empty" is identifiably an empty
+    // WAL rather than a stray zero-length file, and make the NAME durable
+    // too -- a WAL whose directory entry is lost after a crash cannot be
+    // consulted, which defeats the point of having one.
+    std::string buf;
+    encode_wal_header(WalHeader(), &buf);
+    if (!pwrite_all(wal_fd_.get(), buf.data(), buf.size(), 0, err)) {
+      return false;
+    }
+    if (!full_fsync(wal_fd_.get(), err)) {
+      return false;
+    }
+    return fsync_dir(dir_, err);
+  }
+
+  std::string bytes;
+  bytes.resize(static_cast<size_t>(len));
+  size_t got = 0;
+  if (!pread_full(wal_fd_.get(), &bytes[0], bytes.size(), 0, &got, err)) {
+    return false;
+  }
+  bytes.resize(got);
+
+  WalHeader wh;
+  std::string detail;
+  if (decode_wal_header(bytes.data(), bytes.size(), &wh, &detail) !=
+      Problem::kOk) {
+    scan_verdict_.problem = Problem::kBadWal;
+    scan_verdict_.detail = detail;
+    return true;
+  }
+
+  if (bytes.size() <= kWalHeaderBytes) {
+    return true;  // Header only: nothing staged.
+  }
+
+  Record staged;
+  const Problem p =
+      decode_frame(bytes.data() + kWalHeaderBytes,
+                   bytes.size() - kWalHeaderBytes, &staged, nullptr, &detail);
+  if (p != Problem::kOk) {
+    // A torn or damaged WAL frame means step 1's fsync never completed, so
+    // append() never returned success and nobody was ever told the record
+    // existed. Dropping it is the correct answer, not data loss -- and it is
+    // why the WAL frame needs its own CRC: without one, a half-written
+    // staged record would be indistinguishable from a complete one.
+    if (read_only_) {
+      return true;
+    }
+    return truncate_to(wal_fd_.get(), kWalHeaderBytes, err);
+  }
+
+  // A complete staged frame. Exactly two crash points can leave one.
+  if (next_index_ > 0 && staged.index + 1 == next_index_ &&
+      staged.hash == last_hash_) {
+    // It is already the last record in the log: the crash fell between step
+    // 2 and step 3. Clear the WAL and there is nothing else to do.
+    if (read_only_) {
+      return true;
+    }
+    return truncate_to(wal_fd_.get(), kWalHeaderBytes, err);
+  }
+
+  if (staged.index == next_index_ && staged.prev_hash == last_hash_) {
+    // Durable in the WAL but not in the log: the crash fell between step 1
+    // and step 2. Redo the main write. This is the case the whole file
+    // exists for.
+    if (read_only_) {
+      wal_pending_ = true;
+      return true;
+    }
+    std::string frame;
+    append_frame(staged, &frame);
+    if (!pwrite_all(log_fd_.get(), frame.data(), frame.size(), log_end_,
+                    err)) {
+      return false;
+    }
+    if (!full_fsync(log_fd_.get(), err)) {
+      return false;
+    }
+    if (!truncate_to(wal_fd_.get(), kWalHeaderBytes, err)) {
+      return false;
+    }
+    // Re-derive the cached tail state with a full rescan rather than an
+    // incremental update. Recovery is rare, and having one code path that
+    // answers "what is the state of this file" is worth more than the saved
+    // pass -- an incremental update here would be a second implementation of
+    // the same logic, in the one place that is hardest to test.
+    return scan_tail(err);
+  }
+
+  // Intact, and it does not fit. A crash cannot produce this: the WAL holds
+  // at most one record and is cleared before the next append begins. So
+  // either the WAL or the log has been edited, and this is evidence.
+  scan_verdict_.problem = Problem::kBadWal;
+  scan_verdict_.index = staged.index;
+  scan_verdict_.records_verified = record_count_;
+  scan_verdict_.detail =
+      "the WAL holds record " + std::to_string(staged.index) +
+      " but the log's next index is " + std::to_string(next_index_) +
+      " and the staged record does not link to the log's tail";
+  wal_pending_ = true;
+  return true;
+}
+
 bool Log::reconcile_checkpoints(std::string* err) {
   if (!scan_verdict_.ok()) {
     return true;  // Nothing to reconcile against a damaged log.
+  }
+  if (!ckpt_fd_.valid()) {
+    return true;
   }
 
   std::vector<Checkpoint> cps;
@@ -452,7 +699,7 @@ bool Log::reconcile_checkpoints(std::string* err) {
   checkpoint_count_ = cps.size();
   ckpt_end_ = kCheckpointHeaderBytes + cps.size() * kCheckpointFrameBytes;
 
-  if (cv.problem == Problem::kTornCheckpointTail) {
+  if (cv.problem == Problem::kTornCheckpointTail && !read_only_) {
     // A torn trailing frame is a crash artifact in DERIVED data: a checkpoint
     // holds no information that is not already in the records, so cutting the
     // partial frame off loses nothing and the root can be recomputed below.
@@ -477,6 +724,11 @@ bool Log::reconcile_checkpoints(std::string* err) {
   if (checkpoint_count_ + 1 == complete && record_count_ % bs == 0 &&
       pending_hashes_.size() == bs &&
       pending_first_index_ == checkpoint_count_ * bs) {
+    if (read_only_) {
+      // Cannot repair, so say nothing is wrong: the records are intact and
+      // the missing root is derivable. stats reports read_only=1.
+      return true;
+    }
     return seal_pending_block(err);
   }
 
@@ -518,6 +770,11 @@ bool Log::seal_pending_block(std::string* err) {
 }
 
 bool Log::append(const std::string& data, Record* out, std::string* err) {
+  if (read_only_) {
+    *err = "the log at " + dir_ +
+           " was opened read-only (no write access); cannot append";
+    return false;
+  }
   if (!scan_verdict_.ok()) {
     *err = "refusing to append to a damaged log: " + scan_verdict_.message() +
            "; run `chainlog verify`";
@@ -536,19 +793,41 @@ bool Log::append(const std::string& data, Record* out, std::string* err) {
   r.prev_hash = last_hash_;
   r.hash = compute_record_hash(r);
 
+  // The same bytes go to both files. There is no separate WAL record format
+  // to get wrong, and recovery can compare the staged frame with the log's
+  // tail directly.
   std::string frame;
   append_frame(r, &frame);
 
-  // Phase 3: one write, one barrier, then maybe a checkpoint. Durable once
-  // full_fsync returns, but a crash *inside* the write leaves a torn frame at
-  // the tail. Phase 4 puts this behind a write-ahead log so that case becomes
-  // recoverable instead of merely detectable.
+  // --- step 1: stage the record in the WAL and make it durable there ------
+  //
+  // Everything after this point is recoverable. Before it, nothing has been
+  // promised to anybody.
+  //
+  // The frame is written and then the file is cut to exactly its length, so
+  // a longer frame left behind by an earlier failed append cannot leave
+  // trailing bytes after this one. Both operations land under the single
+  // fsync below.
+  if (!pwrite_all(wal_fd_.get(), frame.data(), frame.size(), kWalHeaderBytes,
+                  err)) {
+    return false;
+  }
+  if (!truncate_only(wal_fd_.get(), kWalHeaderBytes + frame.size(), err)) {
+    return false;
+  }
+  if (!full_fsync(wal_fd_.get(), err)) {
+    return false;
+  }
+  crash_if_configured(CrashPoint::kAfterWalWrite);
+
+  // --- step 2: append to the log ------------------------------------------
   if (!pwrite_all(log_fd_.get(), frame.data(), frame.size(), log_end_, err)) {
     return false;
   }
   if (!full_fsync(log_fd_.get(), err)) {
     return false;
   }
+  crash_if_configured(CrashPoint::kAfterMainWrite);
 
   log_end_ += frame.size();
   next_index_ = r.index + 1;
@@ -570,10 +849,21 @@ bool Log::append(const std::string& data, Record* out, std::string* err) {
   // without its records would be a claim about history that cannot be
   // checked. The reverse gap -- records without their checkpoint -- is
   // repaired at the next open().
+  //
+  // Sealing deliberately happens while the WAL entry is still present, which
+  // is what makes after_main_write and before_wal_truncate two genuinely
+  // different states to crash in rather than the same one twice.
   if (record_count_ % bs == 0) {
     if (!seal_pending_block(err)) {
       return false;
     }
+  }
+
+  crash_if_configured(CrashPoint::kBeforeWalTruncate);
+
+  // --- step 3: the staged copy has served its purpose ---------------------
+  if (!truncate_to(wal_fd_.get(), kWalHeaderBytes, err)) {
+    return false;
   }
 
   *out = r;
@@ -582,6 +872,16 @@ bool Log::append(const std::string& data, Record* out, std::string* err) {
 
 bool Log::verify(Verdict* out, std::string* err) const {
   Verdict v;
+
+  // The WAL is inspected only by open(), because resolving one needs write
+  // access and a decision about replay. If open() concluded that the staged
+  // record cannot be explained, that is part of whether this directory
+  // checks out -- so it is reported here, rather than left to whoever
+  // remembers to call scan_verdict() separately.
+  if (scan_verdict_.problem == Problem::kBadWal) {
+    *out = scan_verdict_;
+    return true;
+  }
 
   uint64_t len = 0;
   if (!file_length(log_fd_.get(), &len, err)) {
@@ -906,6 +1206,9 @@ Log::Stats Log::stats() const {
   s.checkpoint_count = checkpoint_count_;
   s.pending_records =
       (header_.block_size == 0) ? 0 : record_count_ % header_.block_size;
+  s.wal_pending = wal_pending_;
+  s.read_only = read_only_;
+  s.locked = locked_;
   return s;
 }
 

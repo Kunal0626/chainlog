@@ -492,3 +492,165 @@ enough for that to matter would need streaming.
 no longer hash to its sealed root, `prove` reports `bad-checkpoint` instead of
 handing over a proof. Emitting it would shift the discovery of tampering onto
 whoever checks the proof later.
+
+---
+
+# The write-ahead log (phase 4)
+
+## `log.wal` layout
+
+```
++------------------+
+| header, 32 bytes |   <- "empty WAL" is exactly this
++------------------+
+| one record frame |   <- at most one, byte-identical to the log's
++------------------+
+```
+
+### Header (32 bytes)
+
+| Offset | Size | Field | Notes |
+|---|---|---|---|
+| 0 | 8 | magic | ASCII `CHLGWAL1` |
+| 8 | 4 | `format_version` | u32 LE, currently `1` |
+| 12 | 4 | `flags` | u32 LE, reserved, must be `0` |
+| 16 | 8 | reserved | u64 LE, must be `0` |
+| 24 | 4 | reserved | u32 LE, must be `0` |
+| 28 | 4 | `crc32` | u32 LE over bytes 0..27 |
+
+Step 3 truncates to **32 bytes, not 0**, so an empty WAL is still identifiably
+a WAL rather than a stray zero-length file.
+
+The staged frame is **byte-identical** to the one written to `log` — same
+magic, same CRC-32, same payload. There is no separate WAL record format to get
+wrong, and recovery can compare the staged frame with the log's tail directly.
+
+## The append protocol
+
+```
+1. write the framed record to log.wal, fsync      <- after_wal_write
+2. append the same frame to log, fsync            <- after_main_write
+   (seal a checkpoint, if this record completes a block)
+                                                  <- before_wal_truncate
+3. truncate log.wal to 32 bytes, fsync
+```
+
+Three fsyncs per append instead of one. That is the cost of the WAL, and phase
+7 measures it.
+
+Sealing happens *between* crash points 2 and 3 on purpose. Without that,
+`after_main_write` and `before_wal_truncate` would be the same program state
+and one of the three injection points would test nothing. With it they are
+genuinely different — record durable but block unsealed, versus record durable
+and block sealed — and both have to recover to the same place.
+
+## What the WAL buys that the hash chain does not
+
+This is the distinction the whole file exists for, and it is the one most worth
+being able to state cleanly.
+
+**The hash chain makes a damaged log DETECTABLE.** `verify` will tell you that
+the last frame is torn.
+
+**The WAL makes an interrupted append RECOVERABLE.** That is a different
+property, and the chain cannot provide it. Consider a crash inside step 2: the
+log now ends with a half-written frame. The chain notices, but it cannot answer
+the only question that matters — *was that record ever supposed to exist?* It
+cannot safely finish the frame (it does not know the missing bytes) and it
+cannot safely discard it (the caller may have been told the append succeeded).
+
+The WAL holds exactly that answer:
+
+| State of `log.wal` | What it means | What recovery does |
+|---|---|---|
+| complete frame, not in the log | step 1's fsync returned, so the record was durable before `log` was touched | **redo**: append it |
+| complete frame, already the log's tail | the crash fell between steps 2 and 3 | clear the WAL; nothing else |
+| torn frame | step 1's fsync never returned, so `append()` never reported success and nobody was told the record existed | **drop** it |
+| complete frame that does not link | impossible from a crash — the WAL holds at most one record and is cleared before the next append — so a file was edited | report `bad-wal`, refuse to append |
+
+That third row is why the staged frame needs its own CRC-32. Without one, a
+half-written staged record would be indistinguishable from a complete one, and
+recovery would have to guess between inventing a record nobody acknowledged and
+discarding one that was promised.
+
+`tests/test_wal.cpp` constructs each of those four states directly, so every
+recovery decision is tested on its own rather than only as a side effect of a
+crash that happened to land there. `tests/crash.sh` then kills the real binary
+at each point and checks the outcome end to end — including twelve consecutive
+crash-and-recover rounds, because one recovery working proves little if the
+recovered state cannot itself be crashed.
+
+## Why `_exit`, not `exit`
+
+`crash_if_configured` calls `_exit(99)`. Using `exit(3)` would run `atexit`
+handlers and flush stdio — so the buffered `index=7 hash=...` line would still
+reach the caller. The process would report a successful append and *then*
+vanish, which is not a crash, it is a lie. `_exit` is the closest thing
+available to pulling the power: no handlers, no destructors, no flushes,
+nothing closed.
+
+Exit status 99 is deliberately outside the CLI's 0/1/2, so a test can tell
+"died where I asked it to" from any real outcome.
+
+The crash points are compiled into the **shipping** binary rather than gated
+behind `-DFAULT_INJECTION`. A separate build would exercise code paths nobody
+runs, which is the opposite of what a crash test is for. The exposure is real
+but narrow: someone who can set environment variables in your process can make
+appends die — and someone who can set your environment variables can also
+replace the binary, so this is not the weak link. A mistyped
+`$CHAINLOG_CRASH_AT` is a **hard error**, not a silent no-op, because a typo in
+a test script must not quietly test nothing.
+
+## Locking
+
+`open()` takes an `flock` on `lock`: `LOCK_EX` for a writer, `LOCK_SH` for a
+read-only open, both with `LOCK_NB`. Non-blocking because a second writer should
+be *told* the log is busy, not silently queued behind an appender that might run
+for hours.
+
+An `flock` belongs to the **open file description**, not the process. Two
+`open()` calls in one process therefore contend exactly as two processes would —
+which is both how `tests/test_wal.cpp` tests it without forking, and why
+`Log::close()` exists: holding one `Log` open while opening a second on the same
+directory is refused, so code that wants to hand the log over needs a way to say
+when it is finished.
+
+What `flock` does **not** do:
+
+- It is **advisory**. A process that never calls `flock` writes regardless. It
+  protects against two cooperating ChainLog processes, not against `dd`.
+- It has historically been unreliable over **NFS**, where it may be emulated
+  with `fcntl` locks or silently do nothing.
+- It is not an integrity mechanism. Everything in the threat model above still
+  applies to an attacker with write access.
+
+## Read-only logs
+
+If the log cannot be opened for writing (permissions, or a read-only mount),
+`open()` falls back to `O_RDONLY`, takes a shared lock, and skips every repair.
+Refusing to look at a log you cannot write would make the verifier useless in
+exactly the case where you most want it: inspecting an archive.
+
+A read-only open cannot replay a staged record, so `stats` reports
+`wal_pending=1` and `verify` prints a note saying the count it just gave is not
+the final one. `read_only=1` and `locked=0` are reported too, so none of this is
+silent.
+
+## Recovery order at `open()`
+
+1. take the lock (exclusive, or shared on a read-only fallback)
+2. validate the log header
+3. scan the tail for framing, and collect the pending block's hashes
+4. **recover the WAL** — replay, clear, drop or report
+5. reconcile the checkpoints — seal one missing trailing block, or trim a torn
+   trailing frame
+
+Step 4 comes before step 5 because replaying a staged record can *complete a
+block*, and therefore change how many checkpoints are expected.
+`a_replay_that_completes_a_block_seals_it` is that ordering being tested.
+
+A successful replay then re-derives the cached tail state with a **full
+rescan** rather than an incremental update. Recovery is rare, and having one
+code path that answers "what is the state of this file" is worth more than the
+saved pass — an incremental update here would be a second implementation of the
+same logic, in the one place that is hardest to test.

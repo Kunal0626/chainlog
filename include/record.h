@@ -121,6 +121,14 @@ enum class Problem {
   kBadCheckpoint,       // a checkpoint disagrees with the records, or the set
                         // of checkpoints is not the expected contiguous run
 
+  // Write-ahead log. A torn WAL frame is NOT reported: it means step 1's
+  // fsync never completed, so the caller was never told the append
+  // succeeded, and the record is simply dropped. kBadWal is for a WAL that
+  // is intact but does not fit the log it sits next to -- which a crash
+  // cannot produce, since the WAL holds at most one record and is cleared
+  // before the next append begins.
+  kBadWal,
+
   // Anchoring (used from phase 5): the log disagrees with a published head.
   kAnchorMismatch,
   kAnchorMissing,    // the log is shorter than the anchored index

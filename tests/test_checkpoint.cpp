@@ -239,6 +239,7 @@ TEST(pending_records_are_not_sealed) {
   CHECK_EQ(s.record_count, 21ull);
   CHECK_EQ(s.checkpoint_count, 2ull);
   CHECK_EQ(s.pending_records, 5ull);
+  log.close();
   CHECK_EQ(pname(verify_dir(d.path()).problem), "ok");
 }
 
@@ -297,10 +298,12 @@ TEST(deleting_the_last_two_checkpoints_is_reported_not_repaired) {
   CHECK(log.open(d.path(), opt, &err));
   CHECK_EQ(pname(log.scan_verdict().problem), "bad-checkpoint");
   CHECK(log.scan_verdict().detail.find("at most one") != std::string::npos);
-  CHECK_EQ(read_cps(d).size(), static_cast<size_t>(2));  // untouched
 
   Record r;
   CHECK(!log.append("should not land", &r, &err));
+
+  log.close();
+  CHECK_EQ(read_cps(d).size(), static_cast<size_t>(2));  // untouched
 }
 
 TEST(one_missing_checkpoint_is_resealed_on_open) {
@@ -322,6 +325,7 @@ TEST(one_missing_checkpoint_is_resealed_on_open) {
   CHECK(log.open(d.path(), opt, &err));
   CHECK_EQ(pname(log.scan_verdict().problem), "ok");
   CHECK_EQ(log.checkpoint_count(), 4ull);
+  log.close();
 
   // And the re-derived checkpoint must be byte-identical to the original,
   // because a checkpoint is a pure function of the records it covers.

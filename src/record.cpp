@@ -121,6 +121,8 @@ const char* problem_name(Problem p) {
       return "torn-checkpoint-tail";
     case Problem::kBadCheckpoint:
       return "bad-checkpoint";
+    case Problem::kBadWal:
+      return "bad-wal";
     case Problem::kAnchorMismatch:
       return "anchor-mismatch";
     case Problem::kAnchorMissing:

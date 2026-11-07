@@ -27,10 +27,12 @@ TST_DIR = $(BUILD)/test
 
 # Engine sources, shared by the release and test builds.
 LIB_SRCS  = src/sha256.cpp src/hex.cpp src/crc32.cpp src/fileio.cpp \
-            src/record.cpp src/merkle.cpp src/checkpoint.cpp src/log.cpp
+            src/record.cpp src/merkle.cpp src/checkpoint.cpp \
+            src/wal.cpp src/faultinject.cpp src/log.cpp
 TEST_SRCS = tests/test.cpp tests/test_sha256.cpp tests/test_crc32.cpp \
             tests/test_record.cpp tests/test_merkle.cpp tests/test_log.cpp \
-            tests/test_checkpoint.cpp tests/log_fixture.cpp
+            tests/test_checkpoint.cpp tests/test_wal.cpp \
+            tests/log_fixture.cpp
 CLI_SRCS  = src/main.cpp
 TOOL_SRCS = tools/cl_sha256.cpp tools/cl_crc32.cpp
 
@@ -49,7 +51,7 @@ TESTBIN   = $(TST_DIR)/chainlog-tests
 TST_CLI_OBJS = $(LIB_SRCS:%.cpp=$(TST_DIR)/%.o) $(CLI_SRCS:%.cpp=$(TST_DIR)/%.o)
 CHAINLOG_ASAN = $(TST_DIR)/chainlog
 
-.PHONY: all test unit oracle cli clean
+.PHONY: all test unit oracle cli crash clean
 all: $(CHAINLOG) $(CL_SHA256) $(CL_CRC32)
 
 # --- compile rules ---------------------------------------------------------
@@ -102,7 +104,13 @@ oracle: $(CL_SHA256) $(CL_CRC32) $(CHAINLOG)
 cli: $(CHAINLOG_ASAN)
 	tests/cli.sh $(CHAINLOG_ASAN)
 
-test: unit oracle cli
+# Crash recovery. Run against the RELEASE binary: the injected _exit(99)
+# leaves AddressSanitizer no chance to run its atexit reporting, and a
+# sanitized build would spend most of the run on the repeated crash rounds.
+crash: $(CHAINLOG)
+	tests/crash.sh $(CHAINLOG)
+
+test: unit oracle cli crash
 
 clean:
 	rm -rf $(BUILD)

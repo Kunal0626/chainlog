@@ -103,6 +103,10 @@ TEST(reopening_continues_the_chain) {
   // The new record must link to the record that was already on disk, which is
   // the whole point of scanning the tail at open time.
   CHECK_EQ(to_hex(fresh.prev_hash), to_hex(tail.hash));
+
+  // The exclusive lock is held until close(), so verify_dir() -- which opens
+  // the directory itself -- has to wait its turn.
+  log.close();
   CHECK_EQ(pname(verify_dir(d.path()).problem), "ok");
 }
 
@@ -135,6 +139,7 @@ TEST(head_and_stats_describe_the_log) {
 
   // block_size came from the options on create; it must survive a reopen,
   // because the checkpoints are only meaningful relative to it.
+  log.close();
   Log again;
   Log::Options defaults;
   CHECK(again.open(d.path(), defaults, &err));
@@ -159,6 +164,7 @@ TEST(records_can_hold_arbitrary_bytes) {
     Record r;
     CHECK(log.append(p, &r, &err));
   }
+  log.close();
   CHECK_EQ(pname(verify_dir(d.path()).problem), "ok");
 
   const std::vector<Record> rs =
