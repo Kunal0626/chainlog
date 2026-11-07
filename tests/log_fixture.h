@@ -51,6 +51,26 @@ void rewrite_frame(std::string* bytes, uint64_t offset,
 // what the chain alone cannot detect.
 void relink_from(std::string* bytes, uint64_t from_index);
 
+// --- building logs ---------------------------------------------------------
+
+// Fixed-width record data, "rec-000007". Fixed width so that every frame is
+// the same length and the tamper tests can swap or rewrite frames without
+// shifting any offsets.
+std::string record_label(uint64_t i);
+
+// Builds a log in `dir` holding n records labelled by record_label().
+void build_log(const std::string& dir, uint64_t n,
+               uint64_t block_size = chainlog::kDefaultBlockSize);
+
+// Opens `dir` and returns what verify() says about it. Aborts on I/O failure,
+// since that means the test itself is broken.
+chainlog::Verdict verify_dir(const std::string& dir);
+
+// Rewrites the checkpoints file from scratch so that every root matches the
+// records currently on disk -- what a thorough attacker would do after
+// re-linking the log. Used to show the last rung of the ladder.
+void reseal_all_checkpoints(const std::string& dir);
+
 }  // namespace chainlog_test
 
 #endif  // CHAINLOG_TESTS_LOG_FIXTURE_H

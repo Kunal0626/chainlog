@@ -256,3 +256,239 @@ consistency rule above. And `SHA256` of bytes `28..64` (the preimage) is
 `eba990e1…`, which is the stored hash — that is the check `verify` step 8 does,
 and it is reproduced independently in Python by
 `tests/oracle_format.py`.
+
+---
+
+# Checkpoints and inclusion proofs (phase 3)
+
+## `checkpoints` layout
+
+```
++------------------+
+| header, 32 bytes |
++------------------+
+| checkpoint 0     |  64 bytes
++------------------+
+| checkpoint 1     |  64 bytes
++------------------+
+| ...              |
++------------------+
+```
+
+Every frame is the same size in version 1, so the offset of the *n*-th
+checkpoint is `32 + n * 64` — exact arithmetic, no walk needed.
+
+### Header (32 bytes)
+
+| Offset | Size | Field | Notes |
+|---|---|---|---|
+| 0 | 8 | magic | ASCII `CHLGCKPT` |
+| 8 | 4 | `format_version` | u32 LE, currently `1` |
+| 12 | 4 | `flags` | u32 LE, reserved, must be `0` |
+| 16 | 8 | `block_size` | u64 LE, **must equal the log's** |
+| 24 | 4 | reserved | u32 LE, must be `0` |
+| 28 | 4 | `crc32` | u32 LE over bytes 0..27 |
+
+`block_size` is deliberately repeated here. It is derived data, so the
+duplication is a consistency check: if the two files disagree, one of them has
+been swapped in from a different log. `a_checkpoints_file_from_another_log_is_caught`
+in `tests/test_checkpoint.cpp` is that check firing.
+
+### Checkpoint frame (64 bytes)
+
+```
++--------+-------------+--------------------------+--------+
+| "CKPT" | payload_len |         payload          | crc32  |
+|   4    |    4 LE     |        52 bytes          |  4 LE  |
++--------+-------------+--------------------------+--------+
+```
+
+Payload:
+
+| Offset | Size | Field |
+|---|---|---|
+| 0 | 4 | `flags` u32 LE (reserved; bit 0 will mean "an HMAC follows") |
+| 4 | 8 | `first_index` u64 LE |
+| 12 | 8 | `last_index` u64 LE |
+| 20 | 32 | `root` |
+
+A range where `last_index < first_index` is rejected at parse time rather than
+trusted — otherwise `last - first + 1` underflows into a gigantic leaf count.
+
+## Merkle hashing
+
+RFC 6962 (Certificate Transparency):
+
+```
+leaf hash  = SHA256(0x00 || record_hash)
+inner node = SHA256(0x01 || left || right)
+```
+
+### Why the 0x00 / 0x01 prefixes
+
+An inner node hashes 64 bytes: two concatenated digests. Without domain
+separation that input is byte-identical to a *leaf* whose payload happens to be
+64 bytes, so an attacker could hand over an interior node and have it accepted
+as a leaf — proving membership of something never appended. The prefixes put
+leaves and inner nodes in disjoint input spaces (RFC 6962 §2.1).
+
+### Why a lone odd node is promoted, not duplicated
+
+The odd node out is carried up **unchanged**. The tempting alternative — hash
+it with a copy of itself, which is what Bitcoin does — is **CVE-2012-2459**.
+
+With duplication, three leaves A, B, C give:
+
+```
+root = H(H(A,B), H(C,C))
+```
+
+which is byte-identical to the root of the **four**-leaf tree A, B, C, C. The
+root therefore stops uniquely committing to the leaf list: two different
+histories share a root, and an inclusion proof becomes ambiguous.
+
+Promotion avoids it because the tree's shape then depends only on *n*, and *n*
+is committed in the checkpoint next to the root.
+`duplicating_the_odd_node_collides` in `tests/test_merkle.cpp` builds the unsafe
+variant and exhibits the actual collision, at sizes 3 and 5.
+
+### The iterative build is RFC 6962's tree
+
+ChainLog builds levels bottom-up in a flat vector. RFC 6962 defines `MTH`
+recursively, splitting at the largest power of two below *n*. These produce the
+same tree, and the reason is worth knowing: a partial node at level *j* covers
+*r* leaves, and either
+
+- `r ≤ 2^(j-1)`, so it is promoted and simply *is* its child, or
+- `2^(j-1) < r ≤ 2^j`, so it splits at `2^(j-1)` — which is exactly the largest
+  power of two below *r*.
+
+That is checked, not assumed: `iterative_build_matches_rfc6962_recursive_mth`
+compares against the recursive definition for every size up to 257, and
+`tests/oracle_format.py` re-derives proofs with the recursive `PATH` in Python
+and `make oracle` requires them to be **byte-identical**.
+
+## Proof wire format
+
+A proof travels between machines as one hex string, so it is self-describing.
+
+| Offset | Size | Field |
+|---|---|---|
+| 0 | 1 | version (`1`) |
+| 1 | 8 | `first_index` u64 LE — first record of the sealed block |
+| 9 | 8 | `tree_size` u64 LE — leaves in that block's tree |
+| 17 | 8 | `leaf_index` u64 LE — position within the block, 0-based |
+| 25 | 1 | `step_count` u8 — at most 64 |
+| 26 | 33 × *n* | per step: `flag` u8 (`0` = sibling on the left) then 32-byte hash |
+| last | 4 | `crc32` u32 LE over every preceding byte |
+
+The CRC is there so a mangled copy-paste reads as **"corrupt proof"** rather
+than **"proof does not verify"**. Those are different answers and an operator
+needs to tell them apart — the same accident-versus-attack split as the record
+frame's CRC. It is why `verify-proof` exits 2 for a truncated proof and 1 for a
+proof that is intact but wrong.
+
+## What a proof binds, exactly
+
+Verification derives the path shape from `(leaf_index, tree_size)` and then
+checks the proof's flags against it, rather than folding along whatever flags it
+was handed.
+
+**The position is pinned.** The left/right flags along a path are the bits of
+the leaf index, least significant first, so within a given tree size no two
+positions share a shape. Checked exhaustively in
+`a_proof_is_bound_to_its_position`: every leaf of a 37-leaf tree, against every
+one of the other 36 claimed positions.
+
+**The tree size is only partly pinned**, and it is worth being exact rather than
+claiming more. The size changes the shape only where it changes the *promotion
+pattern* on that particular path. Leaf 19 has shape `LLRRLR` in trees of 36, 37,
+38, 40, 48 and 64 leaves alike — the same siblings fold to the same root, and
+the verifier cannot tell those sizes apart. Across a 37-leaf tree, 36 of the 37
+leaves have a shape shared with some other size.
+
+This does not weaken the property that matters: producing a proof for a leaf
+that is *not* in the tree still requires inverting SHA-256, because the root has
+to come out right. What it means is that a proof's self-reported `tree_size` is
+convenience, not a committed fact. **The size that counts comes from the trusted
+checkpoint** (`last_index - first_index + 1`), alongside the root the verifier
+already trusts. Pinned as a passing test named
+`a_proof_does_NOT_pin_the_exact_tree_size` so it cannot quietly stop being true.
+
+## Why `verify-proof` needs more than the data
+
+```
+chainlog verify-proof <index> <data> <root> <proof> --timestamp N --prev-hash HEX
+```
+
+A leaf hash is `SHA256(0x00 || SHA256(index || timestamp || data_len || data || prev_hash))`.
+The data alone cannot reproduce it. Accepting a bare leaf hash instead would
+hide the fact that **a leaf commits to the whole record**, which is the property
+that makes the proof worth anything. `chainlog prove` prints a ready-made
+command line with every field filled in, and `<data>` accepts a `hex:` prefix so
+records containing NULs survive a shell round trip.
+
+## What sealing changes about the threat model
+
+Checkpoints are not only what a proof proves *against*. They are a second,
+independent record of history, and that closes one of phase 2's two holes.
+
+| Attacker effort | Caught by | Reported at |
+|---|---|---|
+| flip a byte | CRC-32 | that record |
+| flip a byte, fix the CRC | record hash | that record |
+| flip a byte, fix CRC + hash | the next record's link | *i+1* |
+| re-link the entire tail | **the sealed roots** | first record of the affected block |
+| re-link the tail **and** re-seal every checkpoint | **nothing in the directory** | — |
+
+The fourth rung used to be undetectable. It is caught now — not because the
+hashing got better, but because the attacker has to rewrite a second file too,
+and the old roots are still sitting in it.
+`tamper_step5_relinking_the_log_is_caught_by_the_checkpoints` is that rung;
+`tamper_step6_rewriting_the_checkpoints_too_is_NOT_detected` is the one past it.
+
+## Crash recovery for derived data
+
+A checkpoint holds no information that is not already in its records. That makes
+missing or torn checkpoints *recoverable* in a way tampered records never are,
+and it makes over-eager repair dangerous.
+
+`open()` therefore performs exactly two narrow repairs:
+
+1. **A torn trailing checkpoint frame** is truncated and re-derived. It is
+   always at end of file, so it is a crash artifact.
+2. **Exactly one missing trailing checkpoint**, when the log ends precisely on a
+   block boundary, is re-sealed.
+
+Why at most one: sealing happens *inside* `append()`, after the record's fsync
+and before the next record can be written. So a crash can leave one complete
+block unsealed and never two. If two or more are missing, that did not come from
+a crash — the file was truncated or edited — and re-deriving those roots would
+**destroy the very evidence** that catches the re-link attack above. So that
+case is reported (`bad-checkpoint`) and never repaired. See
+`deleting_the_last_two_checkpoints_is_reported_not_repaired`.
+
+The write order is record first, checkpoint second, for the same reason: a
+checkpoint without its records would be a claim about history that cannot be
+checked, while records without their checkpoint are merely incomplete derived
+state.
+
+## Additional limitations of phase 3
+
+**Proofs only exist for sealed blocks.** `prove` on a record in the block being
+filled fails with the last sealed index, rather than inventing an ephemeral
+root. A root published nowhere proves nothing to anybody.
+
+**`prove` walks the log from the start.** Frames are variable-length and there
+is no offset index, so finding block *b* is O(records before it). An offset
+could be stored in each checkpoint to make this O(block), but that is an
+optimisation without a measurement behind it yet; phase 7 measures it.
+
+**`read_checkpoints` loads the whole file.** One 64-byte checkpoint per
+`block_size` records, so a million-record log is about 60 KB. A log large
+enough for that to matter would need streaming.
+
+**`prove` refuses rather than emitting a known-bad proof.** If a block's records
+no longer hash to its sealed root, `prove` reports `bad-checkpoint` instead of
+handing over a proof. Emitting it would shift the discovery of tampering onto
+whoever checks the proof later.

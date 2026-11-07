@@ -113,6 +113,14 @@ enum class Problem {
   kBrokenLink,       // prev_hash does not match the previous record's hash
   kBadHash,          // the stored hash is not the hash of the record's bytes
 
+  // Checkpoints. A checkpoint holds no information that is not already in the
+  // records, so a MISSING one is never evidence of tampering -- but a
+  // checkpoint that DISAGREES with the records is, and so is a gap in an
+  // append-only file.
+  kTornCheckpointTail,  // the checkpoints file ends part-way through a frame
+  kBadCheckpoint,       // a checkpoint disagrees with the records, or the set
+                        // of checkpoints is not the expected contiguous run
+
   // Anchoring (used from phase 5): the log disagrees with a published head.
   kAnchorMismatch,
   kAnchorMissing,    // the log is shorter than the anchored index

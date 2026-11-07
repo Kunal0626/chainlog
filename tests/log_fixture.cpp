@@ -1,5 +1,9 @@
 #include "log_fixture.h"
 
+#include "checkpoint.h"
+#include "log.h"
+#include "merkle.h"
+
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -159,6 +163,76 @@ void relink_from(std::string* bytes, uint64_t from_index) {
     rewrite_frame(bytes, spans[i].offset, records[i]);
     prev = records[i].hash;
   }
+}
+
+std::string record_label(uint64_t i) {
+  char buf[32];
+  std::snprintf(buf, sizeof(buf), "rec-%06llu",
+                static_cast<unsigned long long>(i));
+  return buf;
+}
+
+void build_log(const std::string& dir, uint64_t n, uint64_t block_size) {
+  chainlog::Log log;
+  chainlog::Log::Options opt;
+  opt.block_size = block_size;
+  std::string err;
+  if (!log.open(dir, opt, &err)) {
+    die("build_log: open failed: " + err);
+  }
+  for (uint64_t i = 0; i < n; ++i) {
+    chainlog::Record r;
+    if (!log.append(record_label(i), &r, &err)) {
+      die("build_log: append failed: " + err);
+    }
+  }
+}
+
+chainlog::Verdict verify_dir(const std::string& dir) {
+  chainlog::Log log;
+  chainlog::Log::Options opt;
+  std::string err;
+  if (!log.open(dir, opt, &err)) {
+    die("verify_dir: open failed: " + err);
+  }
+  chainlog::Verdict v;
+  if (!log.verify(&v, &err)) {
+    die("verify_dir: verify failed: " + err);
+  }
+  return v;
+}
+
+void reseal_all_checkpoints(const std::string& dir) {
+  const std::string log_bytes = read_file(chainlog::Log::log_path(dir));
+
+  chainlog::Header h;
+  std::string detail;
+  if (chainlog::decode_header(log_bytes.data(), log_bytes.size(), &h,
+                              &detail) != chainlog::Problem::kOk) {
+    die("reseal_all_checkpoints: bad log header: " + detail);
+  }
+  const uint64_t bs = h.block_size;
+
+  const std::vector<chainlog::Record> records = read_frames(log_bytes);
+
+  chainlog::CheckpointHeader ch;
+  ch.block_size = bs;
+  std::string out;
+  chainlog::encode_checkpoint_header(ch, &out);
+
+  std::vector<chainlog::Digest> block;
+  for (size_t i = 0; i < records.size(); ++i) {
+    block.push_back(chainlog::compute_record_hash(records[i]));
+    if (block.size() == bs) {
+      chainlog::Checkpoint c;
+      c.first_index = records[i].index + 1 - bs;
+      c.last_index = records[i].index;
+      c.root = chainlog::merkle_root(block);
+      chainlog::append_checkpoint_frame(c, &out);
+      block.clear();
+    }
+  }
+  write_file(chainlog::Log::checkpoints_path(dir), out);
 }
 
 }  // namespace chainlog_test

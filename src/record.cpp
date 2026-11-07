@@ -117,6 +117,10 @@ const char* problem_name(Problem p) {
       return "broken-link";
     case Problem::kBadHash:
       return "bad-hash";
+    case Problem::kTornCheckpointTail:
+      return "torn-checkpoint-tail";
+    case Problem::kBadCheckpoint:
+      return "bad-checkpoint";
     case Problem::kAnchorMismatch:
       return "anchor-mismatch";
     case Problem::kAnchorMissing:

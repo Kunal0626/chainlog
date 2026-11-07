@@ -227,6 +227,131 @@ expect_exit 1 "a corrupt header exits 1" --dir "$D" verify
 expect_stderr_match "bad-header" "a corrupt header is named as such" \
   --dir "$D" verify
 
+# --- checkpoints -----------------------------------------------------------
+
+D="$TMP/sealing"
+i=0
+while [ "$i" -lt 20 ]; do
+  "$CLI" --dir "$D" --block-size 8 append "rec-$i" >/dev/null
+  i=$((i + 1))
+done
+
+expect_stdout_match "^records=20$" "20 records appended" --dir "$D" stats
+expect_stdout_match "^checkpoints=2$" "two blocks sealed" --dir "$D" stats
+expect_stdout_match "^pending_records=4$" "four records still pending" \
+  --dir "$D" stats
+expect_exit 0 "a sealed log verifies" --dir "$D" verify
+
+checks=$((checks + 1))
+CP_LINES="$("$CLI" --dir "$D" checkpoints | wc -l | tr -d ' ')"
+if [ "$CP_LINES" != "2" ]; then
+  fail "checkpoints printed $CP_LINES line(s), wanted 2"
+fi
+expect_stdout_match "^block=0 first_index=0 last_index=7 root=$HEX64$" \
+  "first checkpoint line" --dir "$D" checkpoints
+expect_stdout_match "block=1 first_index=8 last_index=15 root=$HEX64" \
+  "second checkpoint line" --dir "$D" checkpoints
+
+# --- prove -----------------------------------------------------------------
+
+expect_exit 0 "prove a sealed record" --dir "$D" prove 5
+expect_stdout_match "^tree_size=8$" "prove reports the tree size" \
+  --dir "$D" prove 5
+expect_stdout_match "^leaf_index=5$" "prove reports the leaf index" \
+  --dir "$D" prove 5
+expect_stdout_match "^proof_steps=3$" "8 leaves means a 3-step path" \
+  --dir "$D" prove 5
+expect_stdout_match "^proof=[0-9a-f]+$" "the proof is hex" --dir "$D" prove 5
+expect_stdout_match "^verify_command=chainlog " "prove prints a command" \
+  --dir "$D" prove 5
+
+# Records in the block being filled have no root to prove against yet.
+expect_exit 2 "prove refuses an unsealed record" --dir "$D" prove 17
+expect_stderr_match "block being filled" "and says why" --dir "$D" prove 17
+expect_stderr_match "last sealed index is 15" "and where sealing stopped" \
+  --dir "$D" prove 17
+
+expect_exit 2 "prove refuses an index past the end" --dir "$D" prove 20
+expect_stderr_match "past the end" "and says so" --dir "$D" prove 999
+expect_exit 2 "prove rejects a non-numeric index" --dir "$D" prove abc
+
+# --- verify-proof, standalone ----------------------------------------------
+# The whole point: this must work with no log directory in sight. These runs
+# deliberately pass no --dir at all.
+
+checks=$((checks + 1))
+PROVE="$("$CLI" --dir "$D" prove 5)"
+PROOF="$(printf '%s' "$PROVE" | sed -n 's/^proof=//p')"
+ROOT="$(printf '%s' "$PROVE" | sed -n 's/^root=//p')"
+DATA="$(printf '%s' "$PROVE" | sed -n 's/^data_hex=//p')"
+TS="$(printf '%s' "$PROVE" | sed -n 's/^timestamp_ns=//p')"
+PREV="$(printf '%s' "$PROVE" | sed -n 's/^prev_hash=//p')"
+if [ -z "$PROOF" ] || [ -z "$ROOT" ] || [ -z "$TS" ] || [ -z "$PREV" ]; then
+  fail "prove did not print every field verify-proof needs"
+fi
+
+expect_exit 0 "a good proof verifies with no log present" \
+  verify-proof 5 "hex:$DATA" "$ROOT" "$PROOF" --timestamp "$TS" \
+  --prev-hash "$PREV"
+expect_stdout_match "^ok: record 5 is leaf 5 of 8" "and says what it proved" \
+  verify-proof 5 "hex:$DATA" "$ROOT" "$PROOF" --timestamp "$TS" \
+  --prev-hash "$PREV"
+
+# The ready-made command line from `prove` must actually run.
+checks=$((checks + 1))
+CMD="$(printf '%s' "$PROVE" | sed -n 's/^verify_command=chainlog //p')"
+if ! eval "\"$CLI\" $CMD" >/dev/null 2>&1; then
+  fail "the verify_command printed by prove does not run"
+fi
+
+# Literal data works too, for records that are plain text.
+expect_exit 0 "literal <data> is accepted" \
+  verify-proof 5 "rec-5" "$ROOT" "$PROOF" --timestamp "$TS" \
+  --prev-hash "$PREV"
+
+# A proof that does not verify is exit 1: a finding, not a usage error.
+ZEROROOT="0000000000000000000000000000000000000000000000000000000000000000"
+expect_exit 1 "the wrong root is exit 1" \
+  verify-proof 5 "hex:$DATA" "$ZEROROOT" "$PROOF" --timestamp "$TS" \
+  --prev-hash "$PREV"
+expect_exit 1 "the wrong data is exit 1" \
+  verify-proof 5 "rec-6" "$ROOT" "$PROOF" --timestamp "$TS" \
+  --prev-hash "$PREV"
+expect_exit 1 "the wrong timestamp is exit 1" \
+  verify-proof 5 "hex:$DATA" "$ROOT" "$PROOF" --timestamp "$((TS + 1))" \
+  --prev-hash "$PREV"
+expect_exit 1 "the wrong claimed index is exit 1" \
+  verify-proof 6 "hex:$DATA" "$ROOT" "$PROOF" --timestamp "$TS" \
+  --prev-hash "$PREV"
+
+# A mangled proof is exit 2: the operator mistyped something, which says
+# nothing about the log. Keeping this apart from exit 1 is the point.
+expect_exit 2 "a truncated proof is exit 2, not 1" \
+  verify-proof 5 "hex:$DATA" "$ROOT" "${PROOF%????????}" --timestamp "$TS" \
+  --prev-hash "$PREV"
+expect_stderr_match "corrupt <proof>" "and is called corrupt" \
+  verify-proof 5 "hex:$DATA" "$ROOT" "${PROOF%????????}" --timestamp "$TS" \
+  --prev-hash "$PREV"
+expect_exit 2 "non-hex in the proof is exit 2" \
+  verify-proof 5 "hex:$DATA" "$ROOT" "zzzz" --timestamp "$TS" \
+  --prev-hash "$PREV"
+
+# The missing-field message has to explain itself, because "data is not
+# enough" is the single most surprising thing about this command.
+expect_exit 2 "verify-proof without --timestamp is a usage error" \
+  verify-proof 5 "hex:$DATA" "$ROOT" "$PROOF" --prev-hash "$PREV"
+expect_stderr_match "commits to the whole record" \
+  "and explains why the data alone will not do" \
+  verify-proof 5 "hex:$DATA" "$ROOT" "$PROOF" --prev-hash "$PREV"
+expect_exit 2 "verify-proof without --prev-hash is a usage error" \
+  verify-proof 5 "hex:$DATA" "$ROOT" "$PROOF" --timestamp "$TS"
+expect_exit 2 "verify-proof with too few positionals is a usage error" \
+  verify-proof 5 "$ROOT" "$PROOF"
+expect_exit 2 "a bad --prev-hash is a usage error" \
+  verify-proof 5 "hex:$DATA" "$ROOT" "$PROOF" --timestamp "$TS" \
+  --prev-hash "nothex"
+expect_exit 2 "an unknown option is a usage error" --dir "$D" --wat verify
+
 # --- unreadable directory is an I/O error, not a tamper report -------------
 # The distinction the exit codes exist for: "I could not check" must never be
 # reported as "I checked and it is bad".

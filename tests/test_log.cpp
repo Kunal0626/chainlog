@@ -20,54 +20,14 @@ using chainlog::Record;
 using chainlog::Verdict;
 using chainlog::to_hex;
 using chainlog_test::FrameSpan;
+using chainlog_test::build_log;
+using chainlog_test::record_label;
 using chainlog_test::TempDir;
+using chainlog_test::verify_dir;
 
 namespace {
 
 std::string pname(chainlog::Problem p) { return chainlog::problem_name(p); }
-
-// Fixed-width record data, so every frame is the same length and the tamper
-// tests can swap or rewrite frames without changing any offsets.
-std::string label(uint64_t i) {
-  char buf[32];
-  std::snprintf(buf, sizeof(buf), "rec-%06llu",
-                static_cast<unsigned long long>(i));
-  return buf;
-}
-
-void build_log(const std::string& dir, uint64_t n) {
-  Log log;
-  Log::Options opt;
-  std::string err;
-  if (!log.open(dir, opt, &err)) {
-    std::fprintf(stderr, "build_log: open failed: %s\n", err.c_str());
-    std::abort();
-  }
-  for (uint64_t i = 0; i < n; ++i) {
-    Record r;
-    if (!log.append(label(i), &r, &err)) {
-      std::fprintf(stderr, "build_log: append failed: %s\n", err.c_str());
-      std::abort();
-    }
-  }
-}
-
-// Opens `dir` read-only-ish and returns what verify() says about it.
-Verdict verify_dir(const std::string& dir) {
-  Log log;
-  Log::Options opt;
-  std::string err;
-  Verdict v;
-  if (!log.open(dir, opt, &err)) {
-    std::fprintf(stderr, "verify_dir: open failed: %s\n", err.c_str());
-    std::abort();
-  }
-  if (!log.verify(&v, &err)) {
-    std::fprintf(stderr, "verify_dir: verify failed: %s\n", err.c_str());
-    std::abort();
-  }
-  return v;
-}
 
 std::string log_file(const TempDir& d) { return Log::log_path(d.path()); }
 
@@ -113,7 +73,7 @@ TEST(each_record_links_to_the_previous_one) {
   CHECK_EQ(rs.size(), static_cast<size_t>(25));
   for (size_t i = 0; i < rs.size(); ++i) {
     CHECK_EQ(rs[i].index, static_cast<unsigned long long>(i));
-    CHECK_EQ(rs[i].data, label(i));
+    CHECK_EQ(rs[i].data, record_label(i));
     CHECK_EQ(to_hex(rs[i].hash), to_hex(chainlog::compute_record_hash(rs[i])));
     if (i > 0) {
       CHECK_EQ(to_hex(rs[i].prev_hash), to_hex(rs[i - 1].hash));
@@ -155,23 +115,23 @@ TEST(head_and_stats_describe_the_log) {
   CHECK(log.open(d.path(), opt, &err));
   for (uint64_t i = 0; i < 20; ++i) {
     Record r;
-    CHECK(log.append(label(i), &r, &err));
+    CHECK(log.append(record_label(i), &r, &err));
   }
 
   Record h;
   CHECK(log.head(&h));
   CHECK_EQ(h.index, 19ull);
-  CHECK_EQ(h.data, label(19));
+  CHECK_EQ(h.data, record_label(19));
 
   const Log::Stats s = log.stats();
   CHECK_EQ(s.record_count, 20ull);
-  CHECK_EQ(s.data_bytes, 20ull * label(0).size());
+  CHECK_EQ(s.data_bytes, 20ull * record_label(0).size());
   CHECK_EQ(s.block_size, 8ull);
   CHECK_EQ(s.sealed_blocks, 2ull);  // 20 / 8
   CHECK_EQ(s.log_bytes,
            chainlog::kHeaderBytes +
                20ull * (chainlog::kFrameOverheadBytes +
-                        chainlog::kPayloadFixedBytes + label(0).size()));
+                        chainlog::kPayloadFixedBytes + record_label(0).size()));
 
   // block_size came from the options on create; it must survive a reopen,
   // because the checkpoints are only meaningful relative to it.
